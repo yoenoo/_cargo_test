@@ -10,6 +10,10 @@ uv pip install matplotlib
 
 apt-get update && apt-get install -y python3.10-dev build-essential
 
+# install rust cargo
+curl https://sh.rustup.rs -sSf | sh
+. "$HOME/.cargo/env"
+
 
 # instasll rust toolchain
 apt-get update -y

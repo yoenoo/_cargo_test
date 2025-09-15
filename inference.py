@@ -9,12 +9,15 @@ Supports both local files and remote datasets, with configurable generation para
 import os
 import argparse
 import asyncio
+import torch
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import pandas as pd
 from tqdm import tqdm
 from vllm_engine import init_engine, _generate_one
 
+from transformers import AutoTokenizer
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-14B")
 
 # System prompt for Rust code generation
 SYSTEM_PROMPT = """You are a pragmatic Rust programmer who enjoys test driven development. Given the following question, write a Rust function to complete the task. Make the code simple and easy to understand. The code should pass `cargo build` and `cargo clippy`. Try to limit library usage to the standard library std. Be careful with your types, and try to limit yourself to the basic built in types and standard library functions. When writing the function you can think through how to solve the problem and perform reasoning in the comments above the function.
@@ -49,12 +52,23 @@ mod tests {
 Make sure to only respond with a single  ```rust``` block. The unit tests must be defined inside the mod tests {} module. Make sure to import any standard library modules that you need. Do not add a main function.
 """
 
-def format_prompt(rust_prompt: str) -> str:
+def format_prompt(tokenizer, rust_prompt: str, enable_thinking: bool = True) -> str:
     """Format the input prompt for vLLM generation.
 
     We inline the system instruction followed by the user's Rust task prompt.
     """
-    return f"{SYSTEM_PROMPT}\n\n{rust_prompt}\n"
+    # return f"{SYSTEM_PROMPT}\n\n{rust_prompt}\n"
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": rust_prompt}
+    ]
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=enable_thinking
+    )
+    return text
 
 
 def load_dataset(dataset_path: str, oxen_repo: Optional[str] = None) -> pd.DataFrame:
@@ -148,8 +162,15 @@ async def _run_inference_async(
     
     # Initialize vLLM engine
     dtype = "bfloat16" if use_gpu else "float32"
-    print(f"Initializing vLLM engine with model: {model_name} (dtype={dtype})")
-    engine = init_engine(model_path=model_name, dtype=dtype)
+    num_gpus = torch.cuda.device_count() if use_gpu and torch.cuda.is_available() else 0
+    tp_size = num_gpus if num_gpus and num_gpus > 1 else 1
+    # tp_size = 4
+    print(f"Initializing vLLM engine with model: {model_name} (dtype={dtype}, tensor_parallel_size={tp_size})")
+    engine = init_engine(
+        model_path=model_name,
+        dtype=dtype,
+        tensor_parallel_size=tp_size,
+    )
     
     # Process samples
     results = []
@@ -169,7 +190,7 @@ async def _run_inference_async(
 
     for index, row in tqdm(df.iterrows(), total=len(df), desc="Generating"):
         user_prompt = row['rust_prompt']
-        formatted = format_prompt(user_prompt)
+        formatted = format_prompt(tokenizer, user_prompt, enable_thinking=False) ## disable thinking
 
         completions = await _generate_one(
             engine=engine,
@@ -263,11 +284,11 @@ def main():
                        help="Stream generation output to console")
     
     # Generation parameters
-    parser.add_argument("--max-tokens", type=int, default=1024,
+    parser.add_argument("--max-tokens", type=int, default=8192,
                        help="Maximum new tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.2,
+    parser.add_argument("--temperature", type=float, default=0.0,
                        help="Sampling temperature")
-    parser.add_argument("--top-p", type=float, default=0.9,
+    parser.add_argument("--top-p", type=float, default=1.0,
                        help="Top-p (nucleus) sampling parameter")
     parser.add_argument("--deterministic", action="store_true",
                        help="Use deterministic generation (do_sample=False)")
@@ -300,3 +321,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# python3 inference.py "Qwen/Qwen2.5-Coder-1.5B-Instruct" cargo_test_passed_eval.parquet results.parquet --deterministic
