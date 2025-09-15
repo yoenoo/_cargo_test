@@ -21,3 +21,8 @@ rustup component add clippy rustfmt
 # persist cargo in PATH for future shells
 echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> "$HOME/.bashrc"
 echo 'source "$HOME/.cargo/env"' >> "$HOME/.bashrc"
+
+
+git config --global user.name "Yeonwoo Jang"
+git config --global user.email "yjang385@gmail.com"
+git config pull.rebase false
