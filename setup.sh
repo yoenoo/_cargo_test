@@ -5,7 +5,10 @@ uv venv --python=3.10
 source .venv/bin/activate
 
 uv pip install torch datasets transformers trl peft accelerate
+uv pip install vllm
 uv pip install matplotlib
+
+apt-get update && apt-get install -y python3.10-dev build-essential
 
 
 # instasll rust toolchain

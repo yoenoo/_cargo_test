@@ -8,12 +8,12 @@ Supports both local files and remote datasets, with configurable generation para
 
 import os
 import argparse
+import asyncio
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import pandas as pd
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
 from tqdm import tqdm
+from vllm_engine import init_engine, _generate_one
 
 
 # System prompt for Rust code generation
@@ -49,110 +49,12 @@ mod tests {
 Make sure to only respond with a single  ```rust``` block. The unit tests must be defined inside the mod tests {} module. Make sure to import any standard library modules that you need. Do not add a main function.
 """
 
+def format_prompt(rust_prompt: str) -> str:
+    """Format the input prompt for vLLM generation.
 
-class RustCodeInference:
-    """Handles model loading and inference for Rust code generation"""
-    
-    def __init__(
-        self,
-        model_name: str,
-        use_gpu: bool = True,
-        system_prompt: str = SYSTEM_PROMPT
-    ):
-        self.model_name = model_name
-        self.system_prompt = system_prompt
-        self.device = self._setup_device(use_gpu)
-        self.tokenizer = None
-        self.model = None
-        self.streamer = None
-        
-    def _setup_device(self, use_gpu: bool) -> str:
-        """Determine the best device to use"""
-        if use_gpu and torch.cuda.is_available():
-            device = "cuda"
-            print(f"Using GPU: {torch.cuda.get_device_name(0)}")
-        else:
-            device = "cpu"
-            print("Using CPU")
-        return device
-    
-    def load_model(self, verbose: bool = True) -> None:
-        """Load the model and tokenizer"""
-        if verbose:
-            print(f"Loading model: {self.model_name}")
-            
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
-            torch_dtype=torch.bfloat16 if self.device == "cuda" else torch.float32,
-            device_map="auto" if self.device == "cuda" else None
-        ).to(self.device)
-        
-        # Setup text streamer for real-time output (optional)
-        self.streamer = TextStreamer(self.tokenizer, skip_special_tokens=True)
-        
-        if verbose:
-            print(f"Model loaded on device: {self.device}")
-    
-    def format_prompt(self, rust_prompt: str) -> str:
-        """Format the input prompt using the chat template"""
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": rust_prompt}
-        ]
-        
-        # Apply chat template
-        formatted_prompt = self.tokenizer.apply_chat_template(
-            messages, 
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        
-        return formatted_prompt
-    
-    def generate_response(
-        self,
-        prompt: str,
-        max_new_tokens: int = 1024,
-        temperature: float = 0.2,
-        top_p: float = 0.9,
-        do_sample: bool = True,
-        stream_output: bool = False
-    ) -> Dict[str, str]:
-        """Generate a response for a single prompt"""
-        
-        # Format the prompt
-        formatted_prompt = self.format_prompt(prompt)
-        
-        # Tokenize input
-        inputs = self.tokenizer.encode(formatted_prompt, return_tensors="pt").to(self.device)
-        
-        # Generate with optional streaming
-        streamer = self.streamer if stream_output else None
-        
-        with torch.no_grad():
-            outputs = self.model.generate(
-                inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                do_sample=do_sample,
-                streamer=streamer,
-                pad_token_id=self.tokenizer.eos_token_id
-            )
-        
-        # Decode outputs
-        full_response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        response_only = self.tokenizer.decode(
-            outputs[0][len(inputs[0]):], 
-            skip_special_tokens=True
-        )
-        
-        return {
-            "formatted_prompt": formatted_prompt,
-            "full_response": full_response,
-            "response": response_only.strip()
-        }
+    We inline the system instruction followed by the user's Rust task prompt.
+    """
+    return f"{SYSTEM_PROMPT}\n\n{rust_prompt}\n"
 
 
 def load_dataset(dataset_path: str, oxen_repo: Optional[str] = None) -> pd.DataFrame:
@@ -198,7 +100,7 @@ def save_results(
     print(f"{status} results saved to: {output_path}")
 
 
-def run_inference(
+async def _run_inference_async(
     model_name: str,
     dataset_path: str,
     output_path: str,
@@ -244,32 +146,48 @@ def run_inference(
         df = df.head(max_samples)
         print(f"Processing first {max_samples} samples")
     
-    # Initialize inference engine
-    print(f"Initializing inference with model: {model_name}")
-    inference = RustCodeInference(model_name, use_gpu)
-    inference.load_model()
+    # Initialize vLLM engine
+    dtype = "bfloat16" if use_gpu else "float32"
+    print(f"Initializing vLLM engine with model: {model_name} (dtype={dtype})")
+    engine = init_engine(model_path=model_name, dtype=dtype)
     
     # Process samples
     results = []
     
     print(f"\nStarting inference on {len(df)} samples...")
+    # Map generation config to vLLM SamplingParams
+    max_new_tokens = int(generation_config.get("max_new_tokens", 1024))
+    temperature = float(generation_config.get("temperature", 0.2))
+    top_p = float(generation_config.get("top_p", 0.9))
+    do_sample = bool(generation_config.get("do_sample", True))
+    
+    sampling_kwargs: Dict[str, Any] = {
+        "max_tokens": max_new_tokens,
+        "temperature": 0.0 if not do_sample else temperature,
+        "top_p": 1.0 if not do_sample else top_p,
+    }
+
     for index, row in tqdm(df.iterrows(), total=len(df), desc="Generating"):
-        
-        # Generate response
-        generation_result = inference.generate_response(
-            prompt=row['rust_prompt'],
-            stream_output=stream_output,
-            **generation_config
+        user_prompt = row['rust_prompt']
+        formatted = format_prompt(user_prompt)
+
+        completions = await _generate_one(
+            engine=engine,
+            tokenizer=None,
+            prompt=formatted,
+            n_samples=1,
+            **sampling_kwargs,
         )
-        
-        # Store result
+
+        response_text = completions[0] if len(completions) > 0 else ""
+
         result = {
             "task_id": row.get('task_id', f"task_{index}"),
-            "prompt": row['rust_prompt'],
+            "prompt": user_prompt,
             "test_list": row.get('rust_test_list', []),
-            "input": generation_result["formatted_prompt"],
-            "full_response": generation_result["full_response"],
-            "response": generation_result["response"]
+            "input": formatted,
+            "full_response": f"{formatted}{response_text}",
+            "response": response_text.strip(),
         }
         results.append(result)
         
@@ -296,6 +214,33 @@ def run_inference(
     print(f"Results saved to: {output_path}")
     
     return results_df
+
+
+def run_inference(
+    model_name: str,
+    dataset_path: str,
+    output_path: str,
+    oxen_repo: Optional[str] = None,
+    use_gpu: bool = True,
+    max_samples: int = -1,
+    save_every: int = 10,
+    stream_output: bool = False,
+    generation_config: Optional[Dict[str, Any]] = None
+) -> pd.DataFrame:
+    """Synchronous wrapper that executes the async vLLM inference loop."""
+    return asyncio.run(
+        _run_inference_async(
+            model_name=model_name,
+            dataset_path=dataset_path,
+            output_path=output_path,
+            oxen_repo=oxen_repo,
+            use_gpu=use_gpu,
+            max_samples=max_samples,
+            save_every=save_every,
+            stream_output=stream_output,
+            generation_config=generation_config,
+        )
+    )
 
 
 def main():
