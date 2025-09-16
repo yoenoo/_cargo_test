@@ -13,6 +13,7 @@ import time
 import shutil
 import subprocess
 import functools
+import asyncio
 from pathlib import Path
 from uuid import uuid4
 from typing import Any, Callable, Optional
@@ -23,6 +24,7 @@ from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
 from peft import LoraConfig, get_peft_model
+from vllm_engine import init_engine, _generate_one
 
 
 # System prompt for the model
@@ -156,7 +158,7 @@ fn main() {
             f.write(template)
             
         print(f"Created Rust project at: {project_dir}")
-        print(f"Generated code:\n{template}")
+        # print(f"Generated code:\n{template}")
 
         # Write Cargo.toml to make it a valid Rust project
         cargo_file_path = project_dir / "Cargo.toml"
@@ -166,9 +168,9 @@ fn main() {
         # Actually run the cargo tools on the generated code
         results = {}
         for tool in tools:
-            print(f"Running: cargo {tool.name}")
+            # print(f"Running: cargo {tool.name}")
             results = tool.run(results, project_dir)
-            print(f"Result: {results}")
+            # print(f"Result: {results}")
 
         # Clean up the temporary project
         shutil.rmtree(project_dir)
@@ -287,6 +289,68 @@ class RewardFunctions:
         return bool(self.evaluator.extract_test_code(content))
 
 
+class VLLMGRPOTrainer(GRPOTrainer):
+    """GRPOTrainer that uses vLLM engine for rollout generation.
+
+    It formats chat prompts with the tokenizer's chat template and queries
+    the vLLM async engine to obtain completions. The returned structure
+    matches what reward functions expect: a list per sample, each containing
+    assistant message dicts with a "content" field.
+    """
+
+    def __init__(self, *args, vllm_engine=None, tokenizer=None, vllm_sampling_kwargs: Optional[dict] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.vllm_engine = vllm_engine
+        self._chat_tokenizer = tokenizer
+        self._vllm_sampling_kwargs = vllm_sampling_kwargs or {}
+
+    def generate_completions(self, prompts, **gen_kwargs):
+        """Override to generate with vLLM.
+
+        Args:
+            prompts: Iterable of chat messages (list[{"role","content"}]) or raw strings.
+        Returns:
+            List[List[Dict[str,str]]]: For each prompt, a list of assistant messages (num_generations).
+        """
+
+        max_tokens = int(getattr(self.args, "max_completion_length", 786))
+        n_samples = int(getattr(self.args, "num_generations", 1))
+
+        # Default sampling; can be overridden via vllm_sampling_kwargs
+        sampling_kwargs: dict[str, Any] = {
+            "max_tokens": max_tokens,
+            "temperature": 1.0,
+            "top_p": 0.95,
+        }
+        sampling_kwargs.update(self._vllm_sampling_kwargs)
+
+        async def _generate_all():
+            all_outputs = []
+            for prompt in prompts:
+                if isinstance(prompt, list):
+                    # Assume chat format
+                    formatted = self._chat_tokenizer.apply_chat_template(
+                        prompt,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=False,
+                    )
+                else:
+                    formatted = str(prompt)
+
+                texts = await _generate_one(
+                    engine=self.vllm_engine,
+                    tokenizer=None,
+                    prompt=formatted,
+                    n_samples=n_samples,
+                    **sampling_kwargs,
+                )
+                all_outputs.append([{"role": "assistant", "content": t} for t in texts])
+            return all_outputs
+
+        return asyncio.run(_generate_all())
+
+
 def create_dataset(path: str, system_prompt: str) -> Dataset:
     """Create dataset for training"""
     data = load_dataset("parquet", data_files={"train": path})["train"]
@@ -326,7 +390,8 @@ def setup_model_and_tokenizer(
     if use_peft:
         peft_config = LoraConfig(
             r=16,
-            lora_alpha=64,
+            # lora_alpha=64,
+            lora_alpha=32,
             target_modules="all-linear",
             task_type="CAUSAL_LM",
             lora_dropout=0.05,
@@ -371,6 +436,19 @@ def train_rust_coder(
         model_name, use_peft, use_gpu
     )
     
+    # Initialize vLLM engine for rollout generation
+    dtype = "bfloat16" if use_gpu else "float32"
+    num_gpus = torch.cuda.device_count() if use_gpu and torch.cuda.is_available() else 0
+    tp_size = num_gpus if num_gpus and num_gpus > 1 else 1
+    print(f"Initializing vLLM engine with model: {model_name} (dtype={dtype}, tensor_parallel_size={tp_size})")
+    vllm_engine = init_engine(
+        model_path=model_name,
+        dtype=dtype,
+        tensor_parallel_size=tp_size,
+        gpu_memory_utilization=0.7,
+        max_model_len=8192,
+    )
+
     # Setup reward functions
     evaluator = RustCodeEvaluator()
     rewards = RewardFunctions(evaluator)
@@ -399,23 +477,27 @@ def train_rust_coder(
         gradient_accumulation_steps=4,
         num_generations=num_generations,
         max_prompt_length=256,
-        max_completion_length=786,
+        max_completion_length=8192,
         num_train_epochs=num_epochs,
         save_steps=save_steps,
         save_total_limit=1,
         max_grad_norm=0.1,
         log_on_each_node=False,
-        optim="adamw_torch"
+        optim="adamw_torch",
+        report_to=["wandb"],
     )
     
-    # Create trainer
-    trainer = GRPOTrainer(
+    # Create trainer that uses vLLM for rollout generation
+    trainer = VLLMGRPOTrainer(
         model=model,
         processing_class=tokenizer,
         reward_funcs=reward_functions,
         args=training_args,
         train_dataset=train_dataset,
         peft_config=peft_config,
+        vllm_engine=vllm_engine,
+        tokenizer=tokenizer,
+        vllm_sampling_kwargs=dict(),
     )
     
     # Train
@@ -429,13 +511,13 @@ def train_rust_coder(
 if __name__ == "__main__":
     # Example usage
     trainer = train_rust_coder(
-        model_name="Qwen/Qwen2.5-Coder-1.5B-Instruct",
+        model_name="Qwen/Qwen3-14B",
         train_file="cargo_test_passed_train.parquet",
         output_dir="rust_coder_outputs",
         use_peft=True,
         use_gpu=True,
-        num_generations=4,
-        batch_size=1,
+        num_generations=8,
+        batch_size=4,
         learning_rate=5e-6,
         num_epochs=1,
         save_steps=50
