@@ -15,6 +15,7 @@ from typing import List, Dict, Any, Optional
 import pandas as pd
 from tqdm import tqdm
 from vllm_engine import init_engine, _generate_one
+from vllm.lora.request import LoRARequest
 
 from transformers import AutoTokenizer
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-14B")
@@ -123,7 +124,10 @@ async def _run_inference_async(
     max_samples: int = -1,
     save_every: int = 10,
     stream_output: bool = False,
-    generation_config: Optional[Dict[str, Any]] = None
+    generation_config: Optional[Dict[str, Any]] = None,
+    lora_adapter_path: Optional[str] = None,
+    lora_name: str = "adapter",
+    lora_id: int = 1,
 ) -> pd.DataFrame:
     """
     Run inference on the entire dataset
@@ -168,10 +172,21 @@ async def _run_inference_async(
     print(f"Initializing vLLM engine with model: {model_name} (dtype={dtype}, tensor_parallel_size={tp_size})")
     engine = init_engine(
         model_path=model_name,
+        trust_remote_code=True,
         dtype=dtype,
         tensor_parallel_size=tp_size,
+        enable_lora=bool(lora_adapter_path),
     )
     
+    lora_request: Optional[LoRARequest] = None
+    if lora_adapter_path:
+        lora_request = LoRARequest(
+            lora_name=lora_name,
+            lora_int_id=lora_id,
+            lora_path=lora_adapter_path,
+            base_model_name=model_name,
+        )
+
     # Process samples
     results = []
     
@@ -197,6 +212,7 @@ async def _run_inference_async(
             tokenizer=None,
             prompt=formatted,
             n_samples=1,
+            lora_request=lora_request,
             **sampling_kwargs,
         )
 
@@ -246,7 +262,10 @@ def run_inference(
     max_samples: int = -1,
     save_every: int = 10,
     stream_output: bool = False,
-    generation_config: Optional[Dict[str, Any]] = None
+    generation_config: Optional[Dict[str, Any]] = None,
+    lora_adapter_path: Optional[str] = None,
+    lora_name: str = "adapter",
+    lora_id: int = 1,
 ) -> pd.DataFrame:
     """Synchronous wrapper that executes the async vLLM inference loop."""
     return asyncio.run(
@@ -260,6 +279,9 @@ def run_inference(
             save_every=save_every,
             stream_output=stream_output,
             generation_config=generation_config,
+            lora_adapter_path=lora_adapter_path,
+            lora_name=lora_name,
+            lora_id=lora_id,
         )
     )
 
@@ -293,6 +315,14 @@ def main():
     parser.add_argument("--deterministic", action="store_true",
                        help="Use deterministic generation (do_sample=False)")
     
+    # LoRA parameters
+    parser.add_argument("--lora-adapter-path", type=str, default=None,
+                       help="Path to LoRA/PEFT adapter directory (contains adapter_model.safetensors)")
+    parser.add_argument("--lora-name", type=str, default="adapter",
+                       help="Logical LoRA name to register")
+    parser.add_argument("--lora-id", type=int, default=1,
+                       help="Integer ID for the LoRA adapter")
+    
     args = parser.parse_args()
     
     # Prepare generation config
@@ -313,7 +343,10 @@ def main():
         max_samples=args.max_samples,
         save_every=args.save_every,
         stream_output=args.stream,
-        generation_config=generation_config
+        generation_config=generation_config,
+        lora_adapter_path=args.lora_adapter_path,
+        lora_name=args.lora_name,
+        lora_id=args.lora_id,
     )
     
     print(f"Final results shape: {results_df.shape}")

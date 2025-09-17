@@ -3,6 +3,7 @@ import asyncio
 from tqdm.asyncio import tqdm
 from typing import Any, Dict, List, Optional, Tuple
 from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
+from vllm.lora.request import LoRARequest
 
 
 def init_engine(model_path: str, dtype: str, **kwargs: Any) -> AsyncLLMEngine:
@@ -15,6 +16,7 @@ async def _generate_one(
   tokenizer,
   prompt: str,
   n_samples: int = 1,
+  lora_request: Optional[LoRARequest] = None,
   **sampling_kwargs: Any,
 ) -> List[str]:
   sp = SamplingParams(
@@ -23,7 +25,7 @@ async def _generate_one(
   )
 
   req_id = "req-" + str(uuid.uuid4())
-  generator = engine.generate(prompt, sp, req_id)
+  generator = engine.generate(prompt, sp, req_id, lora_request=lora_request)
 
   outputs = []
   async for output in generator:
